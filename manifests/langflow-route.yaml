@@ -1,0 +1,17 @@
+# Apply after Langflow Helm install to fix route timeouts and upload limits
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: langflow-ide
+  namespace: rag-pipeline
+  annotations:
+    haproxy.router.openshift.io/proxy-body-size: "100m"
+    haproxy.router.openshift.io/timeout: "600s"
+spec:
+  to:
+    kind: Service
+    name: langflow-service-frontend
+  port:
+    targetPort: http
+  tls:
+    termination: edge

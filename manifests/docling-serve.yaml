@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docling-serve
+  namespace: rag-pipeline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docling-serve
+  template:
+    metadata:
+      labels:
+        app: docling-serve
+    spec:
+      initContainers:
+        - name: model-loader
+          image: quay.io/docling-project/docling-serve-cpu:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -d "/modelcache/layout" ] && [ -d "/modelcache/tableformer" ]; then
+                echo "Models already downloaded, skipping..."
+              else
+                echo "Downloading models..."
+                docling-tools models download --output-dir=/modelcache layout tableformer
+                echo "Models downloaded successfully"
+              fi
+          volumeMounts:
+            - name: model-cache
+              mountPath: /modelcache
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      containers:
+        - name: docling-serve
+          image: quay.io/docling-project/docling-serve-cpu:latest
+          ports:
+            - containerPort: 5001
+          env:
+            - name: DOCLING_SERVE_MODELS_PATH
+              value: /modelcache
+          volumeMounts:
+            - name: model-cache
+              mountPath: /modelcache
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 60
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: docling-model-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docling-serve
+  namespace: rag-pipeline
+spec:
+  selector:
+    app: docling-serve
+  ports:
+    - port: 5001
+      targetPort: 5001
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: docling-serve
+  namespace: rag-pipeline
+spec:
+  to:
+    kind: Service
+    name: docling-serve
+  port:
+    targetPort: 5001
+  tls:
+    termination: edge
