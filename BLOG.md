@@ -8,16 +8,32 @@ Part 1 of 2
 
 ## What We Are Building
 
-In this blog, we will build a complete RAG pipeline — entirely visually — using Langflow on a Red Hat OpenShift cluster. The pipeline takes a PDF document, extracts text from it, splits it into chunks, embeds each chunk into a vector, stores those vectors in a database, and then lets you ask questions about the document using an LLM.
+In this blog, we will build a complete RAG (Retrieval-Augmented Generation) pipeline — entirely visually, without writing application code — using Langflow on a Red Hat OpenShift cluster. The goal is simple: take a PDF document, make it searchable, and let users ask natural language questions about it with answers grounded in the actual content.
 
-Here is the stack:
+The PDF we are working with is a financial analysis report for Computer Age Management Services Ltd. (CAMS). This is not a clean, text-only document. It contains tables with financial ratios, charts showing P/E trends, multi-column layouts, section headers mixed with numerical data, and image placeholders. A naive text extractor like PyPDF or pdfplumber would lose the table structure, merge columns incorrectly, or skip chart captions entirely. That is why we chose Docling.
 
-- Docling Serve — converts PDFs into structured Markdown text. Deployed on OpenShift using a YAML manifest.
-- Langflow — a low-code visual AI workflow builder. Deployed on OpenShift via Helm chart.
-- Milvus — a vector database that stores embeddings and performs similarity search. Deployed on OpenShift via Helm chart in standalone mode.
-- LlamaStack — Red Hat's unified AI runtime, providing the Granite embedding-125m model for embeddings and Qwen3-0.6B as the LLM. Already deployed on the cluster via OpenShift AI.
+### Why Docling?
 
-Everything runs inside the cluster. There are no external API calls to OpenAI or any other cloud service. The embeddings and LLM inference happen on self-hosted models via LlamaStack, which exposes an OpenAI-compatible API.
+Docling is an open-source document processing tool developed by IBM Research. Unlike simple PDF-to-text extractors, Docling uses deep learning models — a layout analysis model to detect headers, paragraphs, tables, and figures on the page, and a TableFormer model to reconstruct table structure into proper rows and columns. This means that when our CAMS report has a table showing valuation scores, momentum metrics, or P/E ratios, Docling preserves that structure as clean Markdown rather than dumping it as a jumbled string of numbers. For a RAG pipeline, this matters. If the chunked text fed to the embedding model is garbage, no amount of LLM sophistication will produce good answers.
+
+We deploy Docling as a REST API service called Docling Serve on OpenShift. Langflow sends the uploaded PDF to Docling Serve, which returns structured Markdown that we then chunk and embed.
+
+### Why Langflow?
+
+Building a RAG pipeline typically means writing Python code — loading documents, chunking text, calling embedding APIs, connecting to a vector database, constructing prompts, and wiring up the LLM. Langflow lets you do all of this visually. It is a low-code AI workflow builder where each step in the pipeline is a draggable component on a canvas, and you connect them by drawing lines between ports. You can see the entire data flow at a glance, tweak parameters in the UI without touching code, and test the pipeline interactively through a built-in Playground chat interface.
+
+For this blog, Langflow is especially useful because it lets us focus on the architecture and the integration between components rather than getting lost in boilerplate code. It also makes it easy to experiment — swap an embedding model, change chunk sizes, adjust the prompt template — all without redeploying anything. We install Langflow on OpenShift using its official Helm chart.
+
+### The Full Stack
+
+Here is the complete stack we are using:
+
+- Docling Serve — converts complex PDFs into structured Markdown using deep learning layout analysis and table extraction. Deployed on OpenShift using a YAML manifest.
+- Langflow — visual AI workflow builder for designing, running, and testing RAG flows without writing code. Deployed on OpenShift via Helm chart.
+- Milvus — a high-performance vector database that stores embeddings and performs fast similarity search. Deployed on OpenShift via Helm chart in standalone mode (3 pods instead of the full 10+ pod cluster mode).
+- LlamaStack — Red Hat's unified AI runtime, providing the Granite embedding-125m model for generating 768-dimensional embeddings and Qwen3-0.6B as the LLM for answering questions. Already deployed on the cluster via OpenShift AI. LlamaStack exposes both models through an OpenAI-compatible API, so Langflow's OpenAI components work out of the box.
+
+Everything runs inside the OpenShift cluster. There are no external API calls to OpenAI or any other cloud service. The embeddings and LLM inference happen entirely on self-hosted models. This is important for enterprise scenarios where data cannot leave the cluster for compliance or security reasons.
 
 ## Architecture
 
