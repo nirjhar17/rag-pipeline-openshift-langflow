@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exploring Langflow: Building a RAG Pipeline on OpenShift</title>
+  <style>
+    body { font-family: Georgia, 'Times New Roman', serif; max-width: 720px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.8; font-size: 1.05rem; }
+    h1 { font-family: -apple-system, sans-serif; font-size: 2rem; margin-bottom: 8px; }
+    h2 { font-family: -apple-system, sans-serif; font-size: 1.45rem; margin: 44px 0 14px; }
+    h3 { font-family: -apple-system, sans-serif; font-size: 1.15rem; margin: 30px 0 10px; }
+    p { margin-bottom: 18px; }
+    ul, ol { margin: 0 0 18px 24px; }
+    li { margin-bottom: 6px; }
+    pre { background: #f3f4f6; border-radius: 6px; padding: 14px 18px; overflow-x: auto; margin: 14px 0 22px; font-size: 0.86rem; line-height: 1.55; border: 1px solid #e5e7eb; }
+    code { font-family: 'SF Mono', Consolas, monospace; font-size: 0.9em; }
+    p code, li code { background: #f3f4f6; padding: 2px 5px; border-radius: 3px; }
+    blockquote { border-left: 3px solid #2563eb; padding: 10px 18px; margin: 14px 0 22px; background: #f8fafc; }
+    a { color: #2563eb; }
+    hr { border: none; border-top: 1px solid #e5e7eb; margin: 44px 0; }
+    .subtitle { color: #6b7280; font-size: 1.1rem; margin-bottom: 30px; }
+  </style>
+</head>
+<body>
+
+<h1>Exploring Langflow: Building a RAG Pipeline on OpenShift</h1>
+<p class="subtitle">A hands-on guide to visually building a Retrieval-Augmented Generation pipeline using Langflow, Docling, Milvus, and LlamaStack — all running on Red Hat OpenShift. Part 1 of 2.</p>
+
+<hr>
+
+<h2>What We Are Building</h2>
+
+<p>In this blog, we will build a complete RAG pipeline — entirely visually — using Langflow on a Red Hat OpenShift cluster. The pipeline takes a PDF document, extracts text from it, splits it into chunks, embeds each chunk into a vector, stores those vectors in a database, and then lets you ask questions about the document using an LLM.</p>
+
+<p>Here is the stack:</p>
+
+<ul>
+  <li><b>Docling Serve</b> — converts PDFs into structured Markdown text. Deployed on OpenShift using a YAML manifest.</li>
+  <li><b>Langflow</b> — a low-code visual AI workflow builder. Deployed on OpenShift via Helm chart.</li>
+  <li><b>Milvus</b> — a vector database that stores embeddings and performs similarity search. Deployed on OpenShift via Helm chart in standalone mode.</li>
+  <li><b>LlamaStack</b> — Red Hat's unified AI runtime, providing the Granite embedding-125m model for embeddings and Qwen3-0.6B as the LLM. Already deployed on the cluster via OpenShift AI.</li>
+</ul>
+
+<p>Everything runs inside the cluster. There are no external API calls to OpenAI or any other cloud service. The embeddings and LLM inference happen on self-hosted models via LlamaStack, which exposes an OpenAI-compatible API.</p>
+
+<h2>Architecture</h2>
+
+<pre>PDF (CAMS) ──▶ Docling Serve ──▶ Export DoclingDocument ──▶ Split Text
+                                                                │
+                                                                ▼
+LlamaStack (granite-embedding-125m) ──── embeddings ──▶ Milvus (vector DB)
+                                                                │
+LlamaStack (Qwen3-0.6B LLM) ◀──── retrieved context ──────────┘</pre>
+
+<p>The pipeline has two flows inside Langflow. The <b>ingestion flow</b> processes the PDF and stores chunks in Milvus. The <b>retriever flow</b> takes a user question, searches Milvus for relevant chunks, and passes them to Qwen3 to generate an answer.</p>
+
+<h2>OpenShift Cluster Details</h2>
+
+<p>All components run in two namespaces on the cluster:</p>
+
+<ul>
+  <li><b>Docling Serve</b> — namespace <code>rag-pipeline</code>, endpoint <code>http://docling-serve.rag-pipeline.svc.cluster.local:5001</code></li>
+  <li><b>Langflow</b> — namespace <code>rag-pipeline</code>, endpoint <code>http://langflow-service.rag-pipeline.svc.cluster.local:7860</code></li>
+  <li><b>Milvus</b> — namespace <code>rag-pipeline</code>, endpoint <code>http://milvus.rag-pipeline.svc.cluster.local:19530</code></li>
+  <li><b>LlamaStack</b> — namespace <code>my-first-model</code>, endpoint <code>http://lsd-genai-playground-service.my-first-model.svc.cluster.local:8321</code></li>
+  <li><b>Qwen3 LLM</b> — namespace <code>my-first-model</code>, endpoint <code>http://qwen3-0-6b-kserve-workload-svc.my-first-model.svc.cluster.local:8000</code></li>
+</ul>
+
+<h2>Prerequisites</h2>
+
+<p>Before starting, make sure you have:</p>
+
+<ul>
+  <li>An OpenShift cluster with cluster-admin access</li>
+  <li>The Helm CLI installed</li>
+  <li>The <code>oc</code> CLI installed and logged in</li>
+  <li>LlamaStack already deployed with the Granite embedding model and Qwen3 LLM</li>
+</ul>
+
+<pre>oc login -u cluster-admin -p &lt;password&gt; https://api.&lt;cluster&gt;:443</pre>
+
+<hr>
+
+<h2>Step 1: Create the Namespace</h2>
+
+<p>Start by creating a dedicated namespace for the RAG pipeline components.</p>
+
+<pre>oc new-project rag-pipeline</pre>
+
+<hr>
+
+<h2>Step 2: Deploy Docling Serve</h2>
+
+<p>Docling Serve converts PDFs into structured text and Markdown. We deploy it using a YAML manifest that includes a Deployment, a Service, and a Route. The Deployment uses an init container to pre-download the layout and tableformer ML models into a PersistentVolumeClaim so they are cached across pod restarts.</p>
+
+<h3>2.1 Create the PVC for model cache</h3>
+
+<pre>oc apply -f manifests/docling-pvc.yaml</pre>
+
+<h3>2.2 Deploy Docling Serve</h3>
+
+<pre>oc apply -f manifests/docling-serve.yaml</pre>
+
+<p>This creates a Deployment with an init container that downloads the models, a ClusterIP Service on port 5001, and a Route with edge TLS termination.</p>
+
+<h3>2.3 Verify</h3>
+
+<p>Wait for the init container to finish downloading models (about 2 to 5 minutes), then verify the health endpoint.</p>
+
+<pre># Watch pods until docling-serve shows 1/1 Running
+oc get pods -n rag-pipeline -w
+
+# Test the health endpoint
+curl -k https://docling-serve-rag-pipeline.apps.&lt;cluster&gt;/health
+# Expected: {"status":"ok"}</pre>
+
+<hr>
+
+<h2>Step 3: Deploy Langflow via Helm</h2>
+
+<p>Langflow is the visual workflow builder where we design and run our RAG flows. We install it using the official Langflow Helm chart.</p>
+
+<h3>3.1 Install Langflow</h3>
+
+<pre>helm repo add langflow https://langflow-ai.github.io/langflow-helm-charts
+helm repo update
+
+helm install langflow-ide langflow/langflow-ide \
+  --namespace rag-pipeline</pre>
+
+<h3>3.2 Configure Langflow for OpenShift</h3>
+
+<p>By default, Langflow requires login credentials. For a demo environment, we enable auto-login and increase the file upload size limit so we can upload large PDFs.</p>
+
+<pre># Enable auto-login (no API key required)
+oc set env statefulset/langflow-service -n rag-pipeline \
+  LANGFLOW_AUTO_LOGIN=true \
+  LANGFLOW_SKIP_AUTH_AUTO_LOGIN=true
+
+# Increase file upload size limit for PDF uploads
+oc set env deployment/langflow-service-frontend -n rag-pipeline \
+  LANGFLOW_MAX_FILE_SIZE_UPLOAD=100</pre>
+
+<h3>3.3 Fix the Route</h3>
+
+<p>The default OpenShift route has a 30-second timeout, which is too short for Langflow flows that involve PDF processing and LLM inference. We also need to increase the upload body size. Apply the route manifest or patch the existing route.</p>
+
+<pre>oc apply -f manifests/langflow-route.yaml</pre>
+
+<p>Alternatively, you can patch the existing route directly:</p>
+
+<pre>oc annotate route langflow-ide -n rag-pipeline \
+  haproxy.router.openshift.io/proxy-body-size=100m \
+  haproxy.router.openshift.io/timeout=600s \
+  --overwrite</pre>
+
+<h3>3.4 Verify</h3>
+
+<p>Open the Langflow UI in your browser at <code>https://langflow-ide-rag-pipeline.apps.&lt;cluster&gt;</code>. You should see the Langflow dashboard without any login prompt.</p>
+
+<hr>
+
+<h2>Step 4: Deploy Milvus (Vector Database)</h2>
+
+<h3>Why standalone mode?</h3>
+
+<p>Milvus cluster mode deploys 10+ pods including Pulsar, datanode, mixcoord, and querynode. For a blog demo, standalone mode is sufficient and much simpler. It only needs 3 pods: etcd, minio, and the standalone Milvus server.</p>
+
+<h3>4.1 Install Milvus via Helm</h3>
+
+<p>We provide a shell script that handles the full installation, including the OpenShift-specific security context grants.</p>
+
+<pre>chmod +x manifests/milvus-install.sh
+./manifests/milvus-install.sh</pre>
+
+<p>If you prefer to run the commands manually, here is what the script does:</p>
+
+<pre># Add Helm repo
+helm repo add zilliztech https://zilliztech.github.io/milvus-helm/
+helm repo update
+
+# Grant anyuid SCC (OpenShift requires this for etcd/minio)
+oc adm policy add-scc-to-user anyuid -z default -n rag-pipeline
+oc adm policy add-scc-to-user anyuid -z milvus-etcd -n rag-pipeline
+oc adm policy add-scc-to-user anyuid -z milvus-minio -n rag-pipeline
+
+# Install standalone Milvus
+helm install milvus zilliztech/milvus \
+  --namespace rag-pipeline \
+  --set cluster.enabled=false \
+  --set standalone.resources.requests.cpu=500m \
+  --set standalone.resources.requests.memory=2Gi \
+  --set standalone.resources.limits.cpu=2 \
+  --set standalone.resources.limits.memory=4Gi \
+  --set streaming.enabled=false \
+  --set woodpecker.enabled=false \
+  --set pulsarv3.enabled=false \
+  --set pulsar.enabled=false \
+  --set etcd.replicaCount=1 \
+  --set minio.mode=standalone \
+  --set minio.resources.requests.memory=512Mi \
+  --set etcd.resources.requests.memory=512Mi</pre>
+
+<h3>4.2 Key Gotcha: OpenShift SCC</h3>
+
+<p>The etcd container runs as UID 1001, which is outside OpenShift's default allowed UID range. Without the anyuid SCC grant, the etcd pod will be stuck in FailedCreate with the error:</p>
+
+<pre>pods "milvus-etcd-0" is forbidden: unable to validate against any security context constraint</pre>
+
+<h3>4.3 Verify</h3>
+
+<p>Wait about 90 seconds for the readiness probes, then check the pods and test the Milvus API.</p>
+
+<pre># Check Milvus pods
+oc get pods -n rag-pipeline | grep milvus
+
+# Expected:
+# milvus-etcd-0          1/1  Running
+# milvus-minio-xxx       1/1  Running
+# milvus-standalone-xxx  1/1  Running
+
+# Test Milvus API from the Langflow pod
+oc exec langflow-service-0 -n rag-pipeline -- \
+  curl -s http://milvus.rag-pipeline.svc.cluster.local:19530/v2/vectordb/collections/list \
+  -X POST -H "Content-Type: application/json" -d '{}'
+# Expected: {"code":0,"data":[]}</pre>
+
+<hr>
+
+<h2>Step 5: Verify LlamaStack Connectivity</h2>
+
+<p>LlamaStack is already running in the <code>my-first-model</code> namespace. Before building the Langflow flow, verify that Langflow can reach the LlamaStack API.</p>
+
+<pre>oc exec langflow-service-0 -n rag-pipeline -- \
+  curl -s http://lsd-genai-playground-service.my-first-model.svc.cluster.local:8321/v1/models
+
+# Expected output should list: granite-embedding-125m, Qwen/Qwen3-0.6B</pre>
+
+<hr>
+
+<h2>Step 6: Build the Langflow Flow</h2>
+
+<p>Open the Langflow UI and use the Vector Store RAG template as a starting point. We will customize it with our OpenShift-hosted components.</p>
+
+<h3>6.1 Ingestion Flow (Load Data)</h3>
+
+<p>The ingestion flow processes the PDF and stores the resulting chunks in Milvus. The flow is:</p>
+
+<pre>Docling Serve ──▶ Export DoclingDocument ──▶ Split Text ──▶ Milvus
+                                                             ↑
+                        OpenAI Embeddings ───────────────────┘
+                   (granite-embedding-125m via LlamaStack)</pre>
+
+<p>Here is how to configure each component:</p>
+
+<p><b>Docling Serve</b> — Set the server address to <code>http://docling-serve.rag-pipeline.svc.cluster.local:5001</code> and upload your PDF file.</p>
+
+<p><b>Export DoclingDocument</b> — Set the export format to Markdown and the image export mode to placeholder. This component is necessary because Docling outputs a DoclingDocument object, and downstream components need plain text.</p>
+
+<p><b>Split Text</b> — Set the chunk overlap to 200 and the chunk size to 1000. Leave the separator empty for the default.</p>
+
+<p><b>OpenAI Embeddings</b> (from Bundles, then OpenAI) — Set the model to <code>granite-embedding-125m</code>, the OpenAI API Base to <code>http://lsd-genai-playground-service.my-first-model.svc.cluster.local:8321/v1</code>, the API Key to <code>fake</code>, and toggle TikToken Enable to false. This component requires code edits — see section 6.3 below.</p>
+
+<p><b>Milvus</b> — Set the collection name to <code>cams_docs_v2</code>, the connection URI to <code>http://milvus.rag-pipeline.svc.cluster.local:19530</code>, the primary field to <code>pk</code>, the text field to <code>text</code>, and the vector field to <code>vector</code>.</p>
+
+<p><b>Important — Component Choice:</b> Use the OpenAI Embeddings component from the OpenAI bundle (Bundles, then OpenAI), NOT the core "Embedding Model" component and NOT "HuggingFace Embeddings Inference". The OpenAI Embeddings bundle component has the TikToken Enable toggle and OpenAI API Base field exposed in its UI, making it the best fit for custom OpenAI-compatible endpoints like LlamaStack.</p>
+
+<h3>6.2 Retriever Flow (Search + LLM)</h3>
+
+<p>The retriever flow takes a user question, searches Milvus for relevant chunks, and passes them to the LLM. The flow is:</p>
+
+<pre>Chat Input ──▶ OpenAI Embeddings ──▶ Milvus (search) ──▶ Parser (Stringify)
+                                                               │
+Chat Input ──▶ Prompt ◀──── context ───────────────────────────┘
+                 │
+                 ▼
+          OpenAI Model (Qwen3) ──▶ Chat Output</pre>
+
+<p>Here is how to configure each component:</p>
+
+<p><b>Chat Input</b> — This is where you type your question in the Playground, for example "What is the durability score of CAMS?"</p>
+
+<p><b>OpenAI Embeddings</b> (search) — Same configuration as the ingestion embeddings: model <code>granite-embedding-125m</code>, API Base pointing to LlamaStack, API Key <code>fake</code>, TikToken disabled. The same code edits are required.</p>
+
+<p><b>Milvus</b> (search) — Same collection name <code>cams_docs_v2</code> and connection URI as the ingestion Milvus.</p>
+
+<p><b>Parser</b> — Set the mode to <b>Stringify</b>. This is critical. Milvus returns a list of Data objects, and the default Parser mode only handles a single Data object. It will throw "List of Data objects is not supported" if you use Parser mode. Stringify correctly serializes the entire list into plain text.</p>
+
+<p><b>Prompt</b> — Use the following template:</p>
+
+<pre>{context}
+---
+Given the context above, answer the question as best as possible.
+Question: {question}
+Answer:</pre>
+
+<p>Connect the Parser output to the <code>{context}</code> variable and the Chat Input to the <code>{question}</code> variable.</p>
+
+<p><b>OpenAI Model</b> (LLM) — Set the model to <code>vllm-inference-1/Qwen/Qwen3-0.6B</code>, the OpenAI API Base to <code>http://lsd-genai-playground-service.my-first-model.svc.cluster.local:8321/v1</code>, and the API Key to <code>fake</code>. This component also requires code edits — see section 6.5 below.</p>
+
+<p><b>Chat Output</b> — Displays the final LLM response in the Playground.</p>
+
+<p><b>Note on Qwen3 Thinking Mode:</b> Qwen3 outputs <code>&lt;think&gt;...&lt;/think&gt;</code> reasoning tags before the actual answer. This is a built-in feature of Qwen3 that cannot be easily disabled through LlamaStack. The actual answer appears after the <code>&lt;/think&gt;</code> tag.</p>
+
+<h3>6.3 Code Fixes for OpenAI Embeddings Components</h3>
+
+<p>The OpenAI Embeddings bundle component requires two code edits to work with LlamaStack's Granite embeddings. Click the <code>&lt;/&gt;</code> code editor button on each OpenAI Embeddings component and make these changes.</p>
+
+<p><b>Why not use other embedding components?</b></p>
+
+<p>We tried three embedding components before finding the right one:</p>
+
+<ul>
+  <li><b>Embedding Model</b> (core) — has a hardcoded dropdown for model names, no TikToken Enable toggle, and no check_embedding_ctx_length parameter. Required extensive code hacks.</li>
+  <li><b>HuggingFace Embeddings Inference</b> — has a known bug (github.com/langflow-ai/langflow/issues/6345) that concatenates the endpoint URL with the model name, creating an invalid URL like <code>http://...8321/v1granite-embedding-125m</code>.</li>
+  <li><b>OpenAI Embeddings</b> (bundle) — best fit. Has the TikToken Enable toggle and OpenAI API Base field in advanced settings. Only needs two small code edits.</li>
+</ul>
+
+<p><b>Fix 1: Custom Model Name (around line 40)</b></p>
+
+<p>The model field is a locked DropdownInput that only shows OpenAI model names. Change it to a free-text input so you can type <code>granite-embedding-125m</code>.</p>
+
+<pre># FROM:
+        DropdownInput(
+            name="model",
+            display_name="Model",
+            advanced=False,
+            options=OPENAI_EMBEDDING_MODEL_NAMES,
+            value="text-embedding-3-small",
+        ),
+
+# TO:
+        MessageTextInput(
+            name="model",
+            display_name="Model",
+            advanced=False,
+            value="granite-embedding-125m",
+        ),</pre>
+
+<p><b>Fix 2: Disable Context Length Check (around line 75)</b></p>
+
+<p>Even with TikToken disabled via the UI toggle, LangChain falls back to loading a HuggingFace tokenizer to check embedding context length. Since <code>granite-embedding-125m</code> is not a valid HuggingFace model ID, this fails with the error "granite-embedding-125m is not a local folder and is not a valid model identifier". Adding <code>check_embedding_ctx_length=False</code> skips this unnecessary client-side check. The Granite model on LlamaStack handles tokenization server-side.</p>
+
+<pre># Find this line in the build_embeddings method:
+            tiktoken_enabled=self.tiktoken_enable,
+
+# Add check_embedding_ctx_length=False right after it:
+            tiktoken_enabled=self.tiktoken_enable,
+            check_embedding_ctx_length=False,</pre>
+
+<p>After saving the code, also set these in the component's advanced settings: TikToken Enable to false, OpenAI API Base to the LlamaStack endpoint, and OpenAI API Key to <code>fake</code>.</p>
+
+<p><b>Important:</b> Both code fixes must be applied to EACH OpenAI Embeddings component independently. Editing one does not affect the other.</p>
+
+<h3>6.4 Verify Ingestion</h3>
+
+<p>After running the ingestion flow, verify that data was stored in Milvus by querying directly from the Langflow pod.</p>
+
+<pre># Count documents in the collection
+oc exec langflow-service-0 -n rag-pipeline -- \
+  curl -s http://milvus.rag-pipeline.svc.cluster.local:19530/v2/vectordb/entities/query \
+  -X POST -H "Content-Type: application/json" \
+  -d '{"collectionName":"cams_docs_v2","filter":"pk > 0","limit":100,"outputFields":["pk","text"]}'</pre>
+
+<p>Each row in Milvus stores three fields: <code>pk</code> (a unique integer ID), <code>text</code> (the original text chunk), and <code>vector</code> (768 floats from the Granite embedding).</p>
+
+<h3>6.5 Code Fix for OpenAI Model (LLM) Component</h3>
+
+<p>The OpenAI bundle component for the LLM also has a locked dropdown for model names. Click <code>&lt;/&gt;</code> on the OpenAI (LLM) component and make two changes.</p>
+
+<p><b>Fix 1: Custom Model Name (around line 48)</b></p>
+
+<pre># FROM:
+        DropdownInput(
+            name="model_name",
+            display_name="Model Name",
+            advanced=False,
+            options=OPENAI_CHAT_MODEL_NAMES + OPENAI_REASONING_MODEL_NAMES,
+            value=OPENAI_CHAT_MODEL_NAMES[0],
+            combobox=True,
+            real_time_refresh=True,
+        ),
+
+# TO:
+        StrInput(
+            name="model_name",
+            display_name="Model Name",
+            advanced=False,
+            value="vllm-inference-1/Qwen/Qwen3-0.6B",
+        ),</pre>
+
+<p><b>Fix 2: Remove Leaked Display Name (around line 80)</b></p>
+
+<p>Langflow has a bug where it leaks the display_name ("Model Name" with a space) into model_kwargs. This gets passed to the OpenAI client and causes the error: <code>AsyncCompletions.create() got an unexpected keyword argument 'Model Name'</code>. Add two lines to strip it.</p>
+
+<pre># Find this line in the build_model method:
+        model_kwargs = self.model_kwargs or {}
+
+# Add right after it:
+        model_kwargs = self.model_kwargs or {}
+        model_kwargs.pop("Model Name", None)
+        model_kwargs.pop("", None)</pre>
+
+<p>After saving the code, set the OpenAI API Base to the LlamaStack endpoint and the API Key to <code>fake</code> in the component's advanced settings.</p>
+
+<h3>6.6 Test in Playground</h3>
+
+<p>Open the Playground from the bottom-right corner of the Langflow UI and ask questions about your document:</p>
+
+<ul>
+  <li>"What is the durability score of CAMS?"</li>
+  <li>"What are the key financial metrics?"</li>
+  <li>"What is this document about?"</li>
+</ul>
+
+<p>The full retriever flow runs like this: your question is embedded by Granite (the same model that embedded the chunks), Milvus finds the most similar chunks by comparing vectors, the Parser converts the search results to text, the Prompt combines the context with your question, and Qwen3 reads the context and generates an answer.</p>
+
+<hr>
+
+<h2>Troubleshooting</h2>
+
+<p>Here is a summary of every error we encountered during development, along with the fixes.</p>
+
+<p><b>413 Request Entity Too Large</b> — The OpenShift route or Langflow's Nginx rejects large PDF uploads. Fix it by annotating the route with <code>haproxy.router.openshift.io/proxy-body-size=100m</code> and setting the <code>LANGFLOW_MAX_FILE_SIZE_UPLOAD=100</code> environment variable.</p>
+
+<p><b>Flow build failed — Network error after 30 seconds</b> — The OpenShift route has a default timeout of 30 seconds. Fix it by annotating the route with <code>haproxy.router.openshift.io/timeout=600s</code>.</p>
+
+<p><b>Invalid collection name: cams-docs</b> — Milvus collection names cannot contain hyphens. Use underscores instead: <code>cams_docs_v2</code>.</p>
+
+<p><b>uri: ttp://... is illegal</b> — A typo in the Milvus Connection URI. Make sure the URI starts with <code>http://</code>.</p>
+
+<p><b>unrecognized dtype for key: doc</b> — Docling Serve outputs a DoclingDocument object, not plain text. Milvus cannot store the complex doc field. Fix it by adding an Export DoclingDocument component between Docling Serve and Split Text.</p>
+
+<p><b>Text key 'text' not found in DataFrame columns</b> — Split Text expects a text column but receives a DoclingDocument column. Same fix as above: add Export DoclingDocument to convert to Markdown first.</p>
+
+<p><b>No vector field is found</b> — The Embedding output is not connected to the Milvus Embedding port, or the HuggingFace Embeddings Inference component has a known bug that silently fails. Fix it by using the OpenAI Embeddings component and making sure the Embeddings output port is connected to Milvus's Embedding input port.</p>
+
+<p><b>Input should be a valid string (400 from LlamaStack)</b> — LangChain's OpenAIEmbeddings uses tiktoken to pre-tokenize text into integer token IDs. LlamaStack only accepts plain strings. Fix it by toggling TikToken Enable to false and adding <code>check_embedding_ctx_length=False</code> in the component code.</p>
+
+<p><b>granite-embedding-125m is not a local folder and is not a valid model identifier</b> — With TikToken disabled, LangChain falls back to loading a HuggingFace tokenizer. Since granite-embedding-125m is not a valid HuggingFace repo ID, it fails. Fix it by adding <code>check_embedding_ctx_length=False</code> to skip the unnecessary client-side tokenizer.</p>
+
+<p><b>Milvus etcd pod stuck in FailedCreate</b> — OpenShift SCC blocks etcd from running as UID 1001. Fix it by granting the anyuid SCC to the default, milvus-etcd, and milvus-minio service accounts.</p>
+
+<p><b>AsyncCompletions.create() got an unexpected keyword argument 'Model Name'</b> — Langflow leaks the display_name of the model field into model_kwargs. Fix it by adding <code>model_kwargs.pop("Model Name", None)</code> in the component code.</p>
+
+<p><b>List of Data objects is not supported (Parser component)</b> — The Parser component is in Parser mode, which only handles a single Data object. Milvus returns a list of search results. Fix it by switching the Parser to Stringify mode.</p>
+
+<p><b>Milvus deployed in cluster mode (10+ pods)</b> — The default Helm values enable cluster mode with Pulsar. Fix it by adding <code>--set cluster.enabled=false --set pulsarv3.enabled=false --set streaming.enabled=false</code> to the Helm install command.</p>
+
+<hr>
+
+<h2>Results</h2>
+
+<p>After completing both the ingestion and retriever flows, the pipeline is fully operational.</p>
+
+<p>The ingestion flow stored 34 chunks from the CAMS PDF into a Milvus collection called <code>cams_docs_v2</code>. Each chunk has a unique ID, the original text, and a 768-dimensional vector from the Granite embedding-125m model.</p>
+
+<p>For a sample query like "What are the prices of CAMS?", Qwen3 retrieves the relevant financial context from Milvus and returns:</p>
+
+<blockquote>The current P/E ratio for Computer Age Management Services Ltd. is 40.5, based on the P/E Buy Sell Zone analysis.</blockquote>
+
+<h2>Summary of All Code Edits</h2>
+
+<p>All three Langflow components with hardcoded dropdowns needed code fixes via the <code>&lt;/&gt;</code> editor:</p>
+
+<ul>
+  <li><b>OpenAI Embeddings</b> (applied to both ingestion and search instances) — Fix 1: Changed DropdownInput to MessageTextInput for the model field, allowing us to type <code>granite-embedding-125m</code>. Fix 2: Added <code>check_embedding_ctx_length=False</code> to stop the HuggingFace tokenizer fallback.</li>
+  <li><b>OpenAI Model</b> — Fix 1: Changed DropdownInput to StrInput for model_name, allowing us to type <code>vllm-inference-1/Qwen/Qwen3-0.6B</code>. Fix 2: Added <code>model_kwargs.pop("Model Name", None)</code> to remove the leaked display name from the API call.</li>
+</ul>
+
+<hr>
+
+<h2>Next Steps</h2>
+
+<p>In Part 2 of this series, we will evaluate the quality of our RAG pipeline using TrustyAI on OpenShift — measuring retrieval accuracy, answer relevance, and faithfulness.</p>
+
+<p>The complete source code, manifests, and deployment scripts are available on <a href="https://github.com/nirjhar17/rag-pipeline-openshift-langflow">GitHub</a>.</p>
+
+</body>
+</html>
