@@ -10,11 +10,11 @@ Part 1 of 2
 
 In this blog, we will build a complete RAG (Retrieval-Augmented Generation) pipeline — entirely visually, without writing application code — using Langflow on a Red Hat OpenShift cluster. The goal is simple: take a PDF document, make it searchable, and let users ask natural language questions about it with answers grounded in the actual content.
 
-The PDF we are working with is a financial analysis report for Computer Age Management Services Ltd. (CAMS). This is not a clean, text-only document. It contains tables with financial ratios, charts showing P/E trends, multi-column layouts, section headers mixed with numerical data, and image placeholders. A naive text extractor like PyPDF or pdfplumber would lose the table structure, merge columns incorrectly, or skip chart captions entirely. That is why we chose Docling.
+The PDF we are working with is a stock analysis report. This is not a clean, text-only document. It contains tables with financial ratios, charts showing P/E trends, multi-column layouts, section headers mixed with numerical data, and image placeholders. A naive text extractor like PyPDF or pdfplumber would lose the table structure, merge columns incorrectly, or skip chart captions entirely. That is why we chose Docling.
 
 ### Why Docling?
 
-Docling is an open-source document processing tool developed by IBM Research. Unlike simple PDF-to-text extractors, Docling uses deep learning models — a layout analysis model to detect headers, paragraphs, tables, and figures on the page, and a TableFormer model to reconstruct table structure into proper rows and columns. This means that when our CAMS report has a table showing valuation scores, momentum metrics, or P/E ratios, Docling preserves that structure as clean Markdown rather than dumping it as a jumbled string of numbers. For a RAG pipeline, this matters. If the chunked text fed to the embedding model is garbage, no amount of LLM sophistication will produce good answers.
+Docling is an open-source document processing tool developed by IBM Research. Unlike simple PDF-to-text extractors, Docling uses deep learning models — a layout analysis model to detect headers, paragraphs, tables, and figures on the page, and a TableFormer model to reconstruct table structure into proper rows and columns. This means that when our stock report has a table showing valuation scores, momentum metrics, or P/E ratios, Docling preserves that structure as clean Markdown rather than dumping it as a jumbled string of numbers. For a RAG pipeline, this matters. If the chunked text fed to the embedding model is garbage, no amount of LLM sophistication will produce good answers.
 
 We deploy Docling as a REST API service called Docling Serve on OpenShift. Langflow sends the uploaded PDF to Docling Serve, which returns structured Markdown that we then chunk and embed.
 
@@ -38,7 +38,7 @@ Everything runs inside the OpenShift cluster. There are no external API calls to
 ## Architecture
 
 ```
-PDF (CAMS) ──▶ Docling Serve ──▶ Export DoclingDocument ──▶ Split Text
+PDF (Stock Report) ──▶ Docling Serve ──▶ Export DoclingDocument ──▶ Split Text
                                                                 │
                                                                 ▼
 LlamaStack (granite-embedding-125m) ──── embeddings ──▶ Milvus (vector DB)
@@ -300,7 +300,7 @@ Chat Input ──▶ Prompt ◀──── context ─────────�
 
 Here is how to configure each component:
 
-Chat Input — This is where you type your question in the Playground, for example "What is the durability score of CAMS?"
+Chat Input — This is where you type your question in the Playground, for example "What is the durability score of this stock?"
 
 OpenAI Embeddings (search) — Same configuration as the ingestion embeddings: model `granite-embedding-125m`, API Base pointing to LlamaStack, API Key `fake`, TikToken disabled. The same code edits are required.
 
@@ -439,7 +439,7 @@ After saving the code, set the OpenAI API Base to the LlamaStack endpoint and th
 
 Open the Playground from the bottom-right corner of the Langflow UI and ask questions about your document:
 
-- "What is the durability score of CAMS?"
+- "What is the durability score of this stock?"
 - "What are the key financial metrics?"
 - "What is this document about?"
 
@@ -483,11 +483,11 @@ Milvus deployed in cluster mode (10+ pods) — The default Helm values enable cl
 
 After completing both the ingestion and retriever flows, the pipeline is fully operational.
 
-The ingestion flow stored 34 chunks from the CAMS PDF into a Milvus collection called `cams_docs_v2`. Each chunk has a unique ID, the original text, and a 768-dimensional vector from the Granite embedding-125m model.
+The ingestion flow stored 34 chunks from the stock report PDF into a Milvus collection called `cams_docs_v2`. Each chunk has a unique ID, the original text, and a 768-dimensional vector from the Granite embedding-125m model.
 
-For a sample query like "What are the prices of CAMS?", Qwen3 retrieves the relevant financial context from Milvus and returns:
+For a sample query like "What is the P/E ratio of this stock?", Qwen3 retrieves the relevant financial context from Milvus and returns:
 
-> The current P/E ratio for Computer Age Management Services Ltd. is 40.5, based on the P/E Buy Sell Zone analysis.
+> The current P/E ratio is 40.5, based on the P/E Buy Sell Zone analysis.
 
 ## Summary of All Code Edits
 
